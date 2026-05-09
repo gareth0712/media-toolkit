@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from media_toolkit import photos, pdfs, videos
+from media_toolkit import files, photos, pdfs, videos
 from media_toolkit.logging_setup import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -24,6 +24,7 @@ DOMAINS: dict[str, Any] = {
     "videos": videos,
     "photos": photos,
     "pdfs": pdfs,
+    "files": files,
 }
 
 # Default log file path. Override via `--log-file PATH`.
@@ -35,6 +36,7 @@ DOMAIN_MENU_CHOICES: list[tuple[str, str]] = [
     ("Videos", "videos"),
     ("Photos", "photos"),
     ("PDFs", "pdfs"),
+    ("Files", "files"),
 ]
 
 # Exit codes (mirrors HANDOFF Section 7).

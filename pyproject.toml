@@ -27,4 +27,5 @@ packages = [
     "media_toolkit.videos",
     "media_toolkit.photos",
     "media_toolkit.pdfs",
+    "media_toolkit.files",
 ]

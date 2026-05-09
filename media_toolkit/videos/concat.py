@@ -27,6 +27,8 @@ from typing import Iterable
 
 import pysrt
 
+from media_toolkit.path_utils import normalize_path_input
+
 logger = logging.getLogger(__name__)
 
 NAME = "concat"
@@ -695,8 +697,8 @@ def run(args: argparse.Namespace) -> int:
         logger.error("error: aborted by user")
         return EXIT_SETUP_ERROR
 
-    input_dir = Path(args.input_dir).expanduser().resolve()
-    output_root = Path(args.output_dir).expanduser().resolve()
+    input_dir = normalize_path_input(args.input_dir).expanduser().resolve()
+    output_root = normalize_path_input(args.output_dir).expanduser().resolve()
 
     try:
         _ensure_dependencies()
