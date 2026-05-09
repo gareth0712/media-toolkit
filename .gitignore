@@ -219,3 +219,6 @@ __marimo__/
 
 # Claude Code internal state
 .claude/
+
+# Test sample media files (large; not needed in repo)
+samples/
