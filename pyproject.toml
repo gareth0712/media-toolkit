@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "media-toolkit"
+version = "0.1.0"
+description = "Personal Python toolkit for programmatic video, photo, and PDF editing operations."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pysrt",
+    "questionary",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+media-toolkit = "media_toolkit.cli:main"
+
+[tool.setuptools]
+packages = [
+    "media_toolkit",
+    "media_toolkit.videos",
+    "media_toolkit.photos",
+    "media_toolkit.pdfs",
+]
