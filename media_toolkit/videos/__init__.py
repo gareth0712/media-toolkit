@@ -1,3 +1,3 @@
-from media_toolkit.videos import concat
+from media_toolkit.videos import concat, watermark
 
-OPS = [concat]
+OPS = [concat, watermark]

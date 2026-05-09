@@ -94,3 +94,21 @@ When ffmpeg runs inside a heredoc, pipe, or any context where it shares stdin wi
 ### Subagent-spawned background processes die when the subagent ends
 
 We tried running the long re-encode in a subagent's `Bash run_in_background`. When the subagent exited, its bash session was reaped and the ffmpeg child died with it (output dir had a 2 MB partial mp4). Long-running background commands have to be kicked off from the main session, where the bash shell persists for the conversation.
+
+## GPU encoder benchmark (watermark op)
+
+Tested 2026-05-09 on RTX 5090 + apt ffmpeg 4.4.2, drawtext text watermark on 5-min 1080p source.
+
+| Encoder + preset       | Wall  | vs CPU | Output |
+|------------------------|-------|--------|--------|
+| CPU libx264 medium crf 20  | 19.0s | 1.00x | 22.9 MB |
+| GPU h264_nvenc slow cq 23  | 31.1s | 0.61x | 39.7 MB |
+| GPU h264_nvenc medium cq 23 | 16.1s | 1.18x | 36.4 MB |
+| **GPU h264_nvenc fast cq 23** | **11.5s** | **1.65x** | 44.2 MB |
+| GPU h264_nvenc hp cq 23     | 11.9s | 1.60x | 44.2 MB |
+
+Why slow is slower than CPU on this workload: nvenc's `slow` preset trades all speed for quality. For watermarking (where the goal is functional overlay, not archival), `fast` gives a clean 1.65x speedup at cq 23 with no perceptible quality loss. Default changed from `slow` to `fast`.
+
+Trade-off: nvenc cq 23 produces ~2x the bitrate of libx264 crf 20 for similar perceived quality, so output files are roughly twice the size. For an op whose primary purpose is watermarking (not transcoding to a target size), this is acceptable.
+
+The drawtext filter still runs on CPU (libfreetype), so per-frame CPU↔GPU memory transfer overhead exists with nvenc. Even so, GPU fast wins. A fully-GPU pipeline using `overlay_cuda` (available in apt ffmpeg 4.4.2) is possible but would only help for image watermarks, not text. To explore further: render text to PNG once, then composite via `overlay_cuda` for fully-GPU text watermarks.
