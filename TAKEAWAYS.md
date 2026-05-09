@@ -112,3 +112,15 @@ Why slow is slower than CPU on this workload: nvenc's `slow` preset trades all s
 Trade-off: nvenc cq 23 produces ~2x the bitrate of libx264 crf 20 for similar perceived quality, so output files are roughly twice the size. For an op whose primary purpose is watermarking (not transcoding to a target size), this is acceptable.
 
 The drawtext filter still runs on CPU (libfreetype), so per-frame CPU↔GPU memory transfer overhead exists with nvenc. Even so, GPU fast wins. A fully-GPU pipeline using `overlay_cuda` (available in apt ffmpeg 4.4.2) is possible but would only help for image watermarks, not text. To explore further: render text to PNG once, then composite via `overlay_cuda` for fully-GPU text watermarks.
+
+### C path explored: overlay_cuda full-GPU pipeline (rejected)
+
+Tested `overlay_cuda` filter (available in apt ffmpeg 4.4.2) for a fully-GPU watermark pipeline. Three blockers in this version of ffmpeg make it unsuitable for the watermark op:
+
+1. **`overlay_cuda` x/y are `<int>` only** — literal integers, no `W`, `w`, `H`, `h`, or `t` expression variables. Can't express "bottom-right with 30px margin" without per-video ffprobe + Python int math. Worse: motion modes (bounce/drift) require the `t` time variable, which is impossible with int-only x/y.
+2. **No alpha (yuva420p) support** — overlay_cuda fails with `Can't overlay yuva420p on nv12` when the watermark PNG has transparency. Watermarks fundamentally need alpha. There is no clean way to do transparent overlay on GPU in this ffmpeg version.
+3. **Text watermarks impossible** — `drawtext` requires sw (CPU memory) frames; can't be combined with the cuda hwaccel pipeline without download/upload that defeats the point.
+
+ffmpeg 5.x+ reportedly extends overlay_cuda with alpha support and expression evaluation, but the user's apt 4.4.2 doesn't have these. Re-evaluate when ffmpeg ≥6.0 is available.
+
+Bottom line: the current "CPU drawtext + nvenc fast cq 23" pipeline (set as default after the A benchmark) is the best practical option in this environment.
