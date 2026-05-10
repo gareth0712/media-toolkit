@@ -91,8 +91,9 @@ _CJK_RANGES: tuple[tuple[int, int], ...] = (
 # Encoder choices.
 ENCODER_CPU = "cpu"
 ENCODER_GPU = "gpu"
-ENCODER_CHOICES: tuple[str, ...] = (ENCODER_CPU, ENCODER_GPU)
-DEFAULT_ENCODER = ENCODER_CPU
+ENCODER_AUTO = "auto"
+ENCODER_CHOICES: tuple[str, ...] = (ENCODER_CPU, ENCODER_GPU, ENCODER_AUTO)
+DEFAULT_ENCODER = ENCODER_AUTO  # auto-detect GPU at runtime, fall back to CPU.
 
 # Re-encode codec settings (watermark requires re-encode; can't stream-copy).
 # CPU encoder (libx264) — portable, slightly better quality at the same bitrate.
@@ -104,6 +105,37 @@ VIDEO_CRF = 20
 GPU_VIDEO_CODEC = "h264_nvenc"
 GPU_PRESET = "fast"
 GPU_CQ = 23
+
+# GPU availability probe — cached for the lifetime of the process so a batch
+# doesn't re-probe per video. Reset to None in tests that need a clean slate.
+_GPU_AVAILABLE: bool | None = None
+
+# Tiny in-memory NVENC dummy encode used to tell whether the GPU pipeline
+# actually works in this environment (compiled-in support is not enough — snap
+# ffmpeg has h264_nvenc but cannot load libcuda at runtime).
+#
+# Frame size is 256x256: NVENC has per-architecture minimum dimensions
+# (older generations accept ~145x49; Hopper/Blackwell, e.g. RTX 5090, fail
+# below 256x144 with "Frame Dimension less than the minimum supported value"
+# even though the encoder itself is loaded). 256x256 clears every shipping
+# generation while staying tiny enough to encode in well under a second.
+GPU_PROBE_ARGS: tuple[str, ...] = (
+    "-nostdin",
+    "-v",
+    "error",
+    "-f",
+    "lavfi",
+    "-i",
+    "color=black:s=256x256:d=0.04",
+    "-c:v",
+    GPU_VIDEO_CODEC,
+    "-frames:v",
+    "1",
+    "-f",
+    "null",
+    "-",
+)
+GPU_PROBE_TIMEOUT_SEC = 10
 
 AUDIO_CODEC_COPY = "copy"  # audio passes through unchanged
 
@@ -384,6 +416,84 @@ def _build_video_codec_args(encoder: str) -> list[str]:
         "-crf",
         str(VIDEO_CRF),
     ]
+
+
+def is_gpu_available() -> bool:
+    """Probe whether NVIDIA NVENC is usable in this environment.
+
+    Lazily runs a tiny dummy encode via lavfi the first time it's called and
+    caches the result for the lifetime of the process. Returns True only if
+    the dummy encode exits 0 — i.e. ffmpeg has a working GPU + drivers + CUDA
+    libs accessible at runtime. Just having the encoder compiled in is not
+    sufficient (snap ffmpeg has it but cannot load libcuda).
+    """
+    global _GPU_AVAILABLE
+    if _GPU_AVAILABLE is not None:
+        return _GPU_AVAILABLE
+    try:
+        ffmpeg_bin = _get_ffmpeg_bin()
+    except MissingDependencyError as exc:
+        logger.debug("GPU probe skipped: %s", exc)
+        _GPU_AVAILABLE = False
+        return _GPU_AVAILABLE
+    try:
+        result = subprocess.run(
+            [ffmpeg_bin, *GPU_PROBE_ARGS],
+            capture_output=True,
+            text=True,
+            timeout=GPU_PROBE_TIMEOUT_SEC,
+            check=False,
+        )
+        _GPU_AVAILABLE = result.returncode == 0
+        if not _GPU_AVAILABLE:
+            logger.debug(
+                "GPU probe failed (rc=%d): %s",
+                result.returncode,
+                result.stderr.strip()[:200],
+            )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        logger.debug("GPU probe error: %s", exc)
+        _GPU_AVAILABLE = False
+    return _GPU_AVAILABLE
+
+
+def resolve_encoder(requested: str) -> str:
+    """Resolve the user-facing encoder choice into the actual encoder to use.
+
+    Mapping:
+        cpu  -> ``ENCODER_CPU`` (always)
+        gpu  -> ``ENCODER_GPU`` if available, else raises
+                ``WatermarkSetupError`` (user explicitly asked for GPU and we
+                can't deliver — surfacing the failure beats silent fallback)
+        auto -> ``ENCODER_GPU`` if available, else ``ENCODER_CPU`` with INFO log
+
+    Lower-level functions (``apply_watermark_to_video``, ``execute_plan``,
+    ``_build_video_codec_args``) only ever see ``cpu`` or ``gpu`` — never
+    ``auto``. Callers must funnel CLI input through this helper.
+    """
+    if requested == ENCODER_CPU:
+        return ENCODER_CPU
+    if requested == ENCODER_GPU:
+        if is_gpu_available():
+            return ENCODER_GPU
+        raise WatermarkSetupError(
+            "encoder=gpu requested but NVIDIA NVENC is not available in this "
+            "environment. Either install apt ffmpeg with NVIDIA support "
+            "(snap ffmpeg cannot access libcuda), or use --encoder cpu / "
+            "--encoder auto."
+        )
+    if requested == ENCODER_AUTO:
+        if is_gpu_available():
+            logger.info(
+                "encoder=auto: GPU (%s) available, using it", GPU_VIDEO_CODEC
+            )
+            return ENCODER_GPU
+        logger.info(
+            "encoder=auto: GPU not available, falling back to CPU (%s)",
+            VIDEO_CODEC,
+        )
+        return ENCODER_CPU
+    raise WatermarkSetupError(f"unknown encoder choice: {requested!r}")
 
 
 def _escape_drawtext_text(text: str) -> str:
@@ -902,9 +1012,9 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
         default=None,
         help=(
             f"Video encoder (default: {DEFAULT_ENCODER}). "
-            f"'gpu' uses NVIDIA NVENC (~10x faster, requires apt ffmpeg + "
-            f"CUDA driver). 'cpu' uses libx264 (more portable, slightly "
-            f"better quality)."
+            f"'auto' uses GPU when available, falls back to CPU. "
+            f"'gpu' forces NVIDIA NVENC (~1.65x faster, requires apt ffmpeg "
+            f"+ CUDA). 'cpu' forces libx264 (more portable, smaller files)."
         ),
     )
 
@@ -940,9 +1050,13 @@ _MOTION_LABEL_TO_KEY: dict[str, str] = {
     _MOTION_BOUNCE_LABEL: MOTION_BOUNCE,
     _MOTION_DRIFT_LABEL: MOTION_DRIFT,
 }
+_ENCODER_AUTO_LABEL = "auto (use GPU when available, fall back to CPU)"
 _ENCODER_CPU_LABEL = "cpu (libx264, portable)"
-_ENCODER_GPU_LABEL = "gpu (h264_nvenc, ~10x faster, requires NVIDIA + apt ffmpeg)"
+_ENCODER_GPU_LABEL = (
+    "gpu (h264_nvenc, force GPU - fails if unavailable)"
+)
 _ENCODER_LABEL_TO_KEY: dict[str, str] = {
+    _ENCODER_AUTO_LABEL: ENCODER_AUTO,
     _ENCODER_CPU_LABEL: ENCODER_CPU,
     _ENCODER_GPU_LABEL: ENCODER_GPU,
 }
@@ -1053,8 +1167,12 @@ def interactive_args(
     if interactive_mode and encoder is None:
         encoder_label = questionary.select(
             "Encoder:",
-            choices=[_ENCODER_CPU_LABEL, _ENCODER_GPU_LABEL],
-            default=_ENCODER_CPU_LABEL,
+            choices=[
+                _ENCODER_AUTO_LABEL,
+                _ENCODER_CPU_LABEL,
+                _ENCODER_GPU_LABEL,
+            ],
+            default=_ENCODER_AUTO_LABEL,
         ).ask()
         encoder = (
             _ENCODER_LABEL_TO_KEY.get(encoder_label)
@@ -1229,6 +1347,15 @@ def run(args: argparse.Namespace) -> int:
         logger.error("error: %s", exc)
         return EXIT_SETUP_ERROR
 
+    # Resolve auto/gpu/cpu into the concrete encoder lower layers will see.
+    # Done after _ensure_dependencies so the GPU probe has a resolvable
+    # ffmpeg binary to invoke.
+    try:
+        resolved_encoder = resolve_encoder(args.encoder or DEFAULT_ENCODER)
+    except WatermarkSetupError as exc:
+        logger.error("error: %s", exc)
+        return EXIT_SETUP_ERROR
+
     # Build the filter once. Image mode needs the absolute pixel width of
     # the watermark, which depends on the main video width — probe the
     # first source to derive it. Assumes the batch is homogeneous in width
@@ -1283,7 +1410,7 @@ def run(args: argparse.Namespace) -> int:
         is_image=is_image,
         image=image_path,
         log=logger,
-        encoder=args.encoder,
+        encoder=resolved_encoder,
     )
     logger.info(
         "Done: %d processed, %d skipped, %d failed",

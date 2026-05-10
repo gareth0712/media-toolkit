@@ -34,6 +34,7 @@ from media_toolkit.videos.watermark import (
     DEFAULT_POSITION,
     DRIFT_FREQ_X,
     DRIFT_FREQ_Y,
+    ENCODER_AUTO,
     ENCODER_CPU,
     ENCODER_GPU,
     EXIT_OK,
@@ -47,6 +48,7 @@ from media_toolkit.videos.watermark import (
     POSITION_TOP_LEFT,
     POSITION_TOP_RIGHT,
     WatermarkPlanEntry,
+    WatermarkSetupError,
     _build_video_codec_args,
     _escape_ffmpeg_expr,
     apply_watermark_to_video,
@@ -56,8 +58,10 @@ from media_toolkit.videos.watermark import (
     discover_videos,
     format_preview,
     has_cjk_chars,
+    is_gpu_available,
     motion_to_xy_expressions,
     position_to_xy_expressions,
+    resolve_encoder,
     run,
     select_font_file,
 )
@@ -1035,3 +1039,211 @@ def test_run_validates_encoder_choice(tmp_path: Path) -> None:
     rc = run(args)
 
     assert rc == EXIT_SETUP_ERROR
+
+
+# ---------------------------------------------------------------------------
+# is_gpu_available / resolve_encoder — GPU auto-detection
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def reset_gpu_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reset the cached GPU probe result so each test starts from a clean slate.
+
+    Also pins ``_RESOLVED_FFMPEG_BIN`` to a fixed value so the probe doesn't
+    walk PATH and accidentally find a real ffmpeg.
+    """
+    monkeypatch.setattr(watermark_module, "_GPU_AVAILABLE", None)
+    monkeypatch.setattr(watermark_module, "_RESOLVED_FFMPEG_BIN", "ffmpeg")
+
+
+def test_is_gpu_available_returns_true_when_probe_succeeds(
+    reset_gpu_cache: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+
+    monkeypatch.setattr(watermark_module.subprocess, "run", fake_run)
+
+    assert is_gpu_available() is True
+
+
+def test_is_gpu_available_returns_false_when_probe_fails(
+    reset_gpu_cache: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="Cannot load libcuda"
+        )
+
+    monkeypatch.setattr(watermark_module.subprocess, "run", fake_run)
+
+    assert is_gpu_available() is False
+
+
+def test_is_gpu_available_returns_false_on_timeout(
+    reset_gpu_cache: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess:
+        raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=10)
+
+    monkeypatch.setattr(watermark_module.subprocess, "run", fake_run)
+
+    assert is_gpu_available() is False
+
+
+def test_is_gpu_available_caches_result(
+    reset_gpu_cache: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    call_count = {"n": 0}
+
+    def fake_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess:
+        call_count["n"] += 1
+        return subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+
+    monkeypatch.setattr(watermark_module.subprocess, "run", fake_run)
+
+    is_gpu_available()
+    is_gpu_available()
+    is_gpu_available()
+
+    assert call_count["n"] == 1
+
+
+def test_resolve_encoder_cpu_always_returns_cpu(
+    reset_gpu_cache: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # If resolve_encoder probes when given "cpu", this fake_run would force it
+    # via the failure path; we assert it never runs by raising.
+    def boom(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("subprocess.run must not be called for cpu")
+
+    monkeypatch.setattr(watermark_module.subprocess, "run", boom)
+
+    assert resolve_encoder(ENCODER_CPU) == ENCODER_CPU
+
+
+def test_resolve_encoder_gpu_returns_gpu_when_available(
+    reset_gpu_cache: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(watermark_module, "is_gpu_available", lambda: True)
+
+    assert resolve_encoder(ENCODER_GPU) == ENCODER_GPU
+
+
+def test_resolve_encoder_gpu_raises_when_unavailable(
+    reset_gpu_cache: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(watermark_module, "is_gpu_available", lambda: False)
+
+    with pytest.raises(WatermarkSetupError) as exc_info:
+        resolve_encoder(ENCODER_GPU)
+
+    msg = str(exc_info.value).lower()
+    # The message should mention the snap/apt distinction so the user knows
+    # the most common cause and the remediation.
+    assert "snap" in msg
+    assert "apt" in msg
+
+
+def test_resolve_encoder_auto_picks_gpu_when_available(
+    reset_gpu_cache: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(watermark_module, "is_gpu_available", lambda: True)
+
+    assert resolve_encoder(ENCODER_AUTO) == ENCODER_GPU
+
+
+def test_resolve_encoder_auto_picks_cpu_when_gpu_unavailable(
+    reset_gpu_cache: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(watermark_module, "is_gpu_available", lambda: False)
+
+    # No exception, silent fallback.
+    assert resolve_encoder(ENCODER_AUTO) == ENCODER_CPU
+
+
+def test_resolve_encoder_unknown_value_raises() -> None:
+    with pytest.raises(WatermarkSetupError):
+        resolve_encoder("tpu")
+
+
+def test_default_encoder_is_auto() -> None:
+    # Locks in the behavioral change: default mode is auto, not cpu.
+    assert DEFAULT_ENCODER == ENCODER_AUTO
+
+
+def test_run_with_explicit_gpu_returns_setup_error_when_unavailable(
+    tmp_path: Path, reset_gpu_cache: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "a.mp4"
+    src.write_bytes(b"")
+    out = tmp_path / "out.mp4"
+    args = _base_args(
+        input=str(src),
+        output=str(out),
+        text="hi",
+        font_size=24,
+        encoder=ENCODER_GPU,
+    )
+
+    monkeypatch.setattr(watermark_module, "is_gpu_available", lambda: False)
+    # _ensure_dependencies runs before resolve_encoder, so pretend ffmpeg /
+    # ffprobe are on PATH so we exercise the resolve_encoder failure path
+    # specifically, not the dependency-missing one.
+    monkeypatch.setattr(
+        watermark_module.shutil, "which", lambda _name: "/usr/bin/ffmpeg"
+    )
+    monkeypatch.setattr(watermark_module, "_RESOLVED_FFMPEG_BIN", None)
+    monkeypatch.setattr(watermark_module, "_RESOLVED_FFPROBE_BIN", None)
+
+    rc = run(args)
+
+    assert rc == EXIT_SETUP_ERROR
+
+
+def test_run_with_auto_falls_back_silently_when_gpu_unavailable(
+    tmp_path: Path, reset_gpu_cache: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "a.mp4"
+    src.write_bytes(b"")
+    out = tmp_path / "out.mp4"
+    args = _base_args(
+        input=str(src),
+        output=str(out),
+        text="hi",
+        font_size=24,
+        encoder=ENCODER_AUTO,
+    )
+
+    monkeypatch.setattr(watermark_module, "is_gpu_available", lambda: False)
+    monkeypatch.setattr(
+        watermark_module.shutil, "which", lambda _name: "/usr/bin/ffmpeg"
+    )
+    monkeypatch.setattr(watermark_module, "_RESOLVED_FFMPEG_BIN", None)
+    monkeypatch.setattr(watermark_module, "_RESOLVED_FFPROBE_BIN", None)
+
+    captured_encoder: dict[str, str | None] = {"value": None}
+
+    def fake_apply(
+        *,
+        source: Path,
+        destination: Path,
+        filter_arg: str,
+        is_image_watermark: bool,
+        image_path: Path | None,
+        encoder: str = DEFAULT_ENCODER,
+    ) -> int:
+        captured_encoder["value"] = encoder
+        return 0
+
+    monkeypatch.setattr(watermark_module, "apply_watermark_to_video", fake_apply)
+
+    rc = run(args)
+
+    assert rc == EXIT_OK
+    assert captured_encoder["value"] == ENCODER_CPU
