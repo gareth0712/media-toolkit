@@ -21,6 +21,11 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from media_toolkit._ffmpeg import (
+    FFMPEG_CANDIDATES as FFMPEG_CANDIDATES,
+    FFPROBE_CANDIDATES as FFPROBE_CANDIDATES,
+    MissingDependencyError as _SharedMissingDependencyError,
+)
 from media_toolkit.path_utils import normalize_path_input
 
 logger = logging.getLogger(__name__)
@@ -169,13 +174,9 @@ OPACITY_MAX = 1.0
 SCALE_MIN_EXCLUSIVE = 0.0  # scale must be > 0
 SCALE_MAX = 1.0
 
-# ffmpeg / ffprobe binary discovery.
-#
-# Duplicated from videos/concat.py — refactor to shared module
-# (``media_toolkit/_ffmpeg.py``) when a third op needs it. Two ops is not yet
-# enough copy-paste to justify the indirection.
-FFMPEG_CANDIDATES: tuple[str, ...] = ("ffmpeg",)
-FFPROBE_CANDIDATES: tuple[str, ...] = ("ffprobe", "ffmpeg.ffprobe")
+# Cached resolved binary names — kept as module-level variables here so tests
+# can monkeypatch them directly on this module (e.g.
+# ``monkeypatch.setattr(watermark_module, "_RESOLVED_FFMPEG_BIN", None)``).
 _RESOLVED_FFMPEG_BIN: str | None = None
 _RESOLVED_FFPROBE_BIN: str | None = None
 
@@ -188,8 +189,12 @@ class WatermarkSetupError(WatermarkError):
     """Raised for invalid args or missing dependencies."""
 
 
-class MissingDependencyError(WatermarkSetupError):
-    """Raised when ffmpeg / ffprobe are not on PATH."""
+class MissingDependencyError(_SharedMissingDependencyError, WatermarkSetupError):
+    """Raised when ffmpeg / ffprobe are not on PATH.
+
+    Inherits from both the shared ``_ffmpeg.MissingDependencyError`` and
+    ``WatermarkSetupError`` so it is catchable via either base class.
+    """
 
 
 @dataclass(frozen=True)
@@ -686,7 +691,11 @@ def format_preview(
 
 
 def _resolve_binary(candidates: tuple[str, ...]) -> str:
-    """Return the first executable in ``candidates`` resolvable on PATH."""
+    """Return the first executable in ``candidates`` resolvable on PATH.
+
+    Delegates to ``shutil.which`` directly so tests can monkeypatch
+    ``watermark_module.shutil.which`` and observe the effect here.
+    """
     for name in candidates:
         if shutil.which(name) is not None:
             return name

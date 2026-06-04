@@ -27,6 +27,13 @@ from typing import Iterable
 
 import pysrt
 
+from media_toolkit._ffmpeg import (
+    FFMPEG_CANDIDATES as FFMPEG_CANDIDATES,
+    FFPROBE_CANDIDATES as FFPROBE_CANDIDATES,
+    MissingDependencyError as _SharedMissingDependencyError,
+    resolve_ffmpeg_bin as _resolve_ffmpeg_bin,
+    resolve_ffprobe_bin as _resolve_ffprobe_bin,
+)
 from media_toolkit.path_utils import normalize_path_input
 
 logger = logging.getLogger(__name__)
@@ -52,18 +59,13 @@ REENCODE_VIDEO_CRF = "20"
 REENCODE_AUDIO_CODEC = "aac"
 REENCODE_AUDIO_BITRATE = "128k"
 
-# ffmpeg / ffprobe executables. Resolved via PATH at call time.
-#
-# Snap-installed ffmpeg on Ubuntu exposes ffprobe as ``ffmpeg.ffprobe`` (note
-# the dot) rather than the standard ``ffprobe`` name. We probe the candidate
-# tuples in order via ``shutil.which`` so the toolkit works on either layout
-# without requiring environment overrides.
-FFMPEG_CANDIDATES: tuple[str, ...] = ("ffmpeg",)
-FFPROBE_CANDIDATES: tuple[str, ...] = ("ffprobe", "ffmpeg.ffprobe")
-
 # Cached resolved binary names. Populated lazily by ``_ensure_dependencies``;
 # every subprocess call goes through ``_get_ffmpeg_bin`` / ``_get_ffprobe_bin``
 # so we never hardcode a name that might not exist on a given host.
+#
+# These module-level variables are kept here (not only in ``_ffmpeg``) so that
+# tests can monkeypatch them directly on this module (e.g.
+# ``monkeypatch.setattr(concat_module, "_RESOLVED_FFMPEG_BIN", None)``).
 _RESOLVED_FFMPEG_BIN: str | None = None
 _RESOLVED_FFPROBE_BIN: str | None = None
 
@@ -99,8 +101,12 @@ class DuplicateSectionError(ConcatError):
     """Raised when two distinct mp4 files share the same (num1, num2) key."""
 
 
-class MissingDependencyError(ConcatError):
-    """Raised when ffmpeg / ffprobe are not on PATH."""
+class MissingDependencyError(_SharedMissingDependencyError, ConcatError):
+    """Raised when ffmpeg / ffprobe are not on PATH.
+
+    Inherits from both the shared ``_ffmpeg.MissingDependencyError`` and
+    ``ConcatError`` so it is catchable via either base class.
+    """
 
 
 class StreamCopyFailedError(ConcatError):
@@ -293,6 +299,9 @@ def build_timestamps_text(sections: list[Section], durations_ms: list[int]) -> s
 def _resolve_binary(candidates: tuple[str, ...]) -> str:
     """Return the first executable in ``candidates`` resolvable on PATH.
 
+    Delegates to ``shutil.which`` directly so tests can monkeypatch
+    ``concat_module.shutil.which`` and observe the effect here.
+
     Raises:
         MissingDependencyError: if none of the candidates resolve.
     """
@@ -307,10 +316,12 @@ def _resolve_binary(candidates: tuple[str, ...]) -> str:
 def _ensure_dependencies() -> None:
     """Resolve ffmpeg/ffprobe binaries and cache them at module level.
 
+    Uses the module-local ``_resolve_binary`` (which delegates to the
+    monkeypatchable ``shutil.which``) rather than the shared helper so that
+    existing tests that patch ``concat_module.shutil.which`` continue to work.
+
     Raises:
-        MissingDependencyError: if either binary cannot be resolved. The
-            exception message lists every candidate name that was tried so the
-            user can see exactly what's expected on PATH.
+        MissingDependencyError: if either binary cannot be resolved.
     """
     global _RESOLVED_FFMPEG_BIN, _RESOLVED_FFPROBE_BIN
     _RESOLVED_FFMPEG_BIN = _resolve_binary(FFMPEG_CANDIDATES)
@@ -335,7 +346,12 @@ def _get_ffprobe_bin() -> str:
 
 
 def get_duration_ms(mp4_path: Path) -> int:
-    """Return the duration of an mp4 file in milliseconds via ffprobe."""
+    """Return the duration of an mp4 file in milliseconds via ffprobe.
+
+    Raises ``ConcatError`` (not the generic ``RuntimeError`` from
+    ``_ffmpeg.get_duration_ms``) so callers in this module can catch a single
+    domain-specific base type.
+    """
     result = subprocess.run(
         [
             _get_ffprobe_bin(),
