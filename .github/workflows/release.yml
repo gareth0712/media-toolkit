@@ -5,12 +5,19 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: write
+# Least privilege by default; each job grants only the scopes it needs.
+permissions: {}
 
 jobs:
-  build-and-release:
+  # Build runs untrusted project code (build backend) WITHOUT a repo-write
+  # token. It can only read the source, sign provenance via OIDC, and upload
+  # the artifact for the release job to consume.
+  build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read        # checkout the tagged source
+      id-token: write       # OIDC token for signed build provenance
+      attestations: write   # write the provenance attestation
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -23,6 +30,32 @@ jobs:
 
       - name: Build wheel and sdist
         run: python -m build
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: 'dist/*'
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  # Release is the ONLY job with contents:write. It runs no project code —
+  # just downloads the built artifact and publishes the GitHub Release.
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # create the GitHub Release and upload assets
+    steps:
+      - name: Download dist artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist
+          path: dist
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
