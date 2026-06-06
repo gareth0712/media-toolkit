@@ -360,6 +360,11 @@ pipx install ./media_toolkit-0.2.0-py3-none-any.whl
    # or
    pipx upgrade media-toolkit
    ```
+5. _(optional)_ Verify a downloaded wheel's signed build provenance (the release
+   job runs with least privilege; the build job emits an OIDC-signed attestation):
+   ```bash
+   gh attestation verify media_toolkit-0.3.0-py3-none-any.whl --repo gareth0712/media-toolkit
+   ```
 
 > **Note:** The GitHub Actions workflow cannot be fully validated without pushing a real tag (which cuts a real Release). Local `python -m build` + YAML parse is the pre-merge gate; the first real tag validates the workflow end-to-end. Do NOT push a tag during development.
 
