@@ -20,6 +20,10 @@ from media_toolkit.videos.split import (
     EXIT_USER_ABORT,
     MIN_PARTS,
     SECONDS_TO_MS,
+    _MODE_EQUAL_LABEL,
+    _MODE_SEGMENT_LABEL,
+    _METHOD_STREAM_COPY_LABEL,
+    _METHOD_REENCODE_LABEL,
     build_output_pattern,
     compute_equal_split_points,
     compute_segment_time_points,
@@ -502,3 +506,329 @@ def test_run_custom_output_dir_is_respected(
     assert rc == EXIT_OK
     call = calls["split"][0]
     assert str(out_dir) in call["output_pattern"]  # type: ignore[index]
+
+
+# ---------------------------------------------------------------------------
+# interactive_args — mode/value prompts (new behaviour)
+# ---------------------------------------------------------------------------
+
+
+class _FakeQuestion:
+    """Minimal stand-in for a questionary Question object (has .ask())."""
+
+    def __init__(self, return_value: object) -> None:
+        self._return_value = return_value
+
+    def ask(self) -> object:
+        return self._return_value
+
+
+def _patch_questionary_interactive(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    input_value: str,
+    mode_label: str,
+    value_str: str,
+    method_label: str,
+) -> None:
+    """Patch questionary inside split_module so interactive_args returns promptly.
+
+    Call sequence in interactive_args (input=None path):
+      1. questionary.path("Input video file:").ask()      → input_value
+      2. questionary.select("Split into:", ...).ask()      → mode_label
+      3. questionary.text("Number of parts:" or "Chunk length in seconds:", ...).ask() → value_str
+      4. questionary.select("Split method:", ...).ask()    → method_label
+      5. questionary.confirm("Proceed with the split?").ask() → True  (via run())
+    """
+    import questionary as _q
+
+    _select_answers = [mode_label, method_label]
+    _select_idx = [0]
+
+    def fake_path(*_args: object, **_kwargs: object) -> _FakeQuestion:
+        return _FakeQuestion(input_value)
+
+    def fake_select(*_args: object, **_kwargs: object) -> _FakeQuestion:
+        answer = _select_answers[_select_idx[0]]
+        _select_idx[0] += 1
+        return _FakeQuestion(answer)
+
+    def fake_text(*_args: object, **_kwargs: object) -> _FakeQuestion:
+        return _FakeQuestion(value_str)
+
+    def fake_confirm(*_args: object, **_kwargs: object) -> _FakeQuestion:
+        return _FakeQuestion(True)
+
+    monkeypatch.setattr(_q, "path", fake_path)
+    monkeypatch.setattr(_q, "select", fake_select)
+    monkeypatch.setattr(_q, "text", fake_text)
+    monkeypatch.setattr(_q, "confirm", fake_confirm)
+
+
+def test_interactive_equal_parts_sets_parts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full interactive flow: selecting Equal parts + entering '4' sets parts=4."""
+    video = tmp_path / "lecture.mp4"
+    video.write_bytes(b"")
+    calls = _patch_dependencies(monkeypatch, tmp_path, duration_ms=7_766_692)
+    _patch_questionary_interactive(
+        monkeypatch,
+        input_value=str(video),
+        mode_label=_MODE_EQUAL_LABEL,
+        value_str="4",
+        method_label=_METHOD_STREAM_COPY_LABEL,
+    )
+
+    # Pass a bare Namespace with all None — simulates zero CLI flags.
+    args = argparse.Namespace(
+        input=None,
+        output_dir=None,
+        parts=None,
+        segment_time=None,
+        reencode=None,
+        yes=False,
+        quiet=False,
+    )
+    rc = run(args)
+
+    assert rc == EXIT_OK
+    assert len(calls["split"]) == 1
+    # Equal parts=4 on 7766692ms → 3 interior cut-points.
+    assert calls["split"][0]["segment_times_str"] == "1941.673,3883.346,5825.019"  # type: ignore[index]
+    assert calls["split"][0]["reencode"] is False  # type: ignore[index]
+
+
+def test_interactive_fixed_chunks_sets_segment_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full interactive flow: selecting Fixed-length chunks + entering '600' sets segment_time=600.0."""
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"")
+    calls = _patch_dependencies(monkeypatch, tmp_path, duration_ms=1_800_000)  # 1800s
+    _patch_questionary_interactive(
+        monkeypatch,
+        input_value=str(video),
+        mode_label=_MODE_SEGMENT_LABEL,
+        value_str="600",
+        method_label=_METHOD_STREAM_COPY_LABEL,
+    )
+
+    args = argparse.Namespace(
+        input=None,
+        output_dir=None,
+        parts=None,
+        segment_time=None,
+        reencode=None,
+        yes=False,
+        quiet=False,
+    )
+    rc = run(args)
+
+    assert rc == EXIT_OK
+    assert len(calls["split"]) == 1
+    # 1800s / 600s → 2 interior cut-points at 600s, 1200s.
+    assert calls["split"][0]["segment_times_str"] == "600.000,1200.000"  # type: ignore[index]
+
+
+def test_interactive_reencode_selected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selecting Re-encode method passes reencode=True to split_video."""
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"")
+    calls = _patch_dependencies(monkeypatch, tmp_path, duration_ms=10_000)
+    _patch_questionary_interactive(
+        monkeypatch,
+        input_value=str(video),
+        mode_label=_MODE_EQUAL_LABEL,
+        value_str="2",
+        method_label=_METHOD_REENCODE_LABEL,
+    )
+
+    args = argparse.Namespace(
+        input=None,
+        output_dir=None,
+        parts=None,
+        segment_time=None,
+        reencode=None,
+        yes=False,
+        quiet=False,
+    )
+    rc = run(args)
+
+    assert rc == EXIT_OK
+    assert calls["split"][0]["reencode"] is True  # type: ignore[index]
+
+
+
+def test_interactive_validate_parts_rejects_abc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Number-of-parts validator rejects 'abc' and returns an error string."""
+    import questionary as _q
+
+    captured_validators: list[object] = []
+
+    def fake_path(*_a: object, **_kw: object) -> object:
+        class _R:
+            def ask(self) -> str:
+                return "/fake/video.mp4"
+        return _R()
+
+    _select_call_idx = [0]
+    _select_answers_list = [_MODE_EQUAL_LABEL]
+
+    def fake_select(*_a: object, **_kw: object) -> object:
+        ans = _select_answers_list[_select_call_idx[0] % len(_select_answers_list)]
+        _select_call_idx[0] += 1
+        class _R:
+            def ask(self_inner) -> str:  # noqa: N805
+                return ans
+        return _R()
+
+    def fake_text(*_a: object, **kw: object) -> object:
+        if "validate" in kw:
+            captured_validators.append(kw["validate"])
+        class _R:
+            def ask(self) -> str:
+                return "3"
+        return _R()
+
+    monkeypatch.setattr(_q, "path", fake_path)
+    monkeypatch.setattr(_q, "select", fake_select)
+    monkeypatch.setattr(_q, "text", fake_text)
+
+    from media_toolkit.videos.split import interactive_args
+
+    prefilled = argparse.Namespace(
+        input=None,
+        output_dir=None,
+        parts=None,
+        segment_time=None,
+        reencode=None,
+        yes=False,
+        quiet=False,
+    )
+    interactive_args(prefilled=prefilled)
+
+    assert len(captured_validators) == 1, "Expected exactly one text validator (for parts)"
+    validate = captured_validators[0]
+    assert callable(validate)
+    # "abc" must be rejected.
+    result = validate("abc")  # type: ignore[operator]
+    assert result is not True, f"Expected rejection of 'abc', got: {result!r}"
+    # A valid int >= MIN_PARTS must be accepted.
+    assert validate("3") is True  # type: ignore[operator]
+    # An int < MIN_PARTS must be rejected.
+    result_low = validate("1")  # type: ignore[operator]
+    assert result_low is not True, f"Expected rejection of '1' (< MIN_PARTS={MIN_PARTS})"
+
+
+def test_interactive_validate_segment_rejects_abc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Chunk-length validator rejects 'abc' and values <= 0."""
+    import questionary as _q
+
+    captured_validators: list[object] = []
+
+    def fake_path(*_a: object, **_kw: object) -> object:
+        class _R:
+            def ask(self) -> str:
+                return "/fake/video.mp4"
+        return _R()
+
+    _select_call_idx = [0]
+    _select_answers_list = [_MODE_SEGMENT_LABEL]
+
+    def fake_select(*_a: object, **_kw: object) -> object:
+        ans = _select_answers_list[_select_call_idx[0] % len(_select_answers_list)]
+        _select_call_idx[0] += 1
+        class _R:
+            def ask(self_inner) -> str:  # noqa: N805
+                return ans
+        return _R()
+
+    def fake_text(*_a: object, **kw: object) -> object:
+        if "validate" in kw:
+            captured_validators.append(kw["validate"])
+        class _R:
+            def ask(self) -> str:
+                return "30.0"
+        return _R()
+
+    monkeypatch.setattr(_q, "path", fake_path)
+    monkeypatch.setattr(_q, "select", fake_select)
+    monkeypatch.setattr(_q, "text", fake_text)
+
+    from media_toolkit.videos.split import interactive_args
+
+    prefilled = argparse.Namespace(
+        input=None,
+        output_dir=None,
+        parts=None,
+        segment_time=None,
+        reencode=None,
+        yes=False,
+        quiet=False,
+    )
+    interactive_args(prefilled=prefilled)
+
+    assert len(captured_validators) == 1, "Expected exactly one text validator (for segment)"
+    validate = captured_validators[0]
+    assert callable(validate)
+    # "abc" must be rejected.
+    result = validate("abc")  # type: ignore[operator]
+    assert result is not True, f"Expected rejection of 'abc', got: {result!r}"
+    # Zero must be rejected.
+    result_zero = validate("0")  # type: ignore[operator]
+    assert result_zero is not True, f"Expected rejection of '0'"
+    # Negative must be rejected.
+    result_neg = validate("-5")  # type: ignore[operator]
+    assert result_neg is not True, f"Expected rejection of '-5'"
+    # A valid positive float must be accepted.
+    assert validate("30.5") is True  # type: ignore[operator]
+
+
+def test_interactive_abort_on_mode_select_returns_user_abort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the user aborts the 'Split into:' prompt (returns None), run() returns EXIT_USER_ABORT."""
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"")
+    _patch_dependencies(monkeypatch, tmp_path, duration_ms=10_000)
+
+    import questionary as _q
+
+    def fake_path(*_a: object, **_kw: object) -> object:
+        class _R:
+            def ask(self) -> str:
+                return str(video)
+        return _R()
+
+    def fake_select_abort(*_a: object, **_kw: object) -> object:
+        class _R:
+            def ask(self) -> None:
+                return None  # user aborted
+        return _R()
+
+    monkeypatch.setattr(_q, "path", fake_path)
+    monkeypatch.setattr(_q, "select", fake_select_abort)
+
+    args = argparse.Namespace(
+        input=None,
+        output_dir=None,
+        parts=None,
+        segment_time=None,
+        reencode=None,
+        yes=False,
+        quiet=False,
+    )
+    rc = run(args)
+
+    assert rc == EXIT_USER_ABORT

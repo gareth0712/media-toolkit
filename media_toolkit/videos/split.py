@@ -63,6 +63,8 @@ MIN_PARTS = 2
 # Interactive-prompt label constants.
 _METHOD_STREAM_COPY_LABEL = "Stream copy (lossless, fast, keyframe-snapped)"
 _METHOD_REENCODE_LABEL = "Re-encode (libx264/aac, exact-length parts, slow)"
+_MODE_EQUAL_LABEL = "Equal parts (N pieces of equal length)"
+_MODE_SEGMENT_LABEL = "Fixed-length chunks (every N seconds)"
 
 
 # ---------------------------------------------------------------------------
@@ -418,10 +420,62 @@ def interactive_args(
     if input_value is None:
         input_value = questionary.path("Input video file:").ask()
 
+    # Split mode + value prompts — only when in interactive mode AND neither
+    # --parts nor --segment-time was supplied on the CLI.
+    if interactive_mode and parts is None and segment_time is None:
+        mode_label = questionary.select(
+            "Split into:",
+            choices=[_MODE_EQUAL_LABEL, _MODE_SEGMENT_LABEL],
+            default=_MODE_EQUAL_LABEL,
+        ).ask()
+        if mode_label is None:
+            # User aborted — signal abort by setting a sentinel so run() detects it.
+            parts = None
+            segment_time = None
+            # Return early with abort sentinel on reencode too.
+            reencode = None
+        elif mode_label == _MODE_EQUAL_LABEL:
+            def _validate_parts(val: str) -> bool | str:
+                try:
+                    n = int(val)
+                except ValueError:
+                    return f"Enter a whole number (got {val!r})"
+                if n < MIN_PARTS:
+                    return f"Number of parts must be at least {MIN_PARTS}; got {n}"
+                return True
+
+            raw_parts = questionary.text(
+                "Number of parts:",
+                validate=_validate_parts,
+            ).ask()
+            if raw_parts is None:
+                reencode = None  # propagate abort
+            else:
+                parts = int(raw_parts)
+        else:
+            def _validate_segment(val: str) -> bool | str:
+                try:
+                    s = float(val)
+                except ValueError:
+                    return f"Enter a positive number (got {val!r})"
+                if s <= 0:
+                    return "Chunk length must be greater than 0"
+                return True
+
+            raw_seg = questionary.text(
+                "Chunk length in seconds:",
+                validate=_validate_segment,
+            ).ask()
+            if raw_seg is None:
+                reencode = None  # propagate abort
+            else:
+                segment_time = float(raw_seg)
+
     # ``--reencode`` interactive prompt: offer the two-option select that the
     # user asked for as "the last step before proceeding to the video edit."
-    # Only prompt when in interactive mode AND the flag was not passed on CLI.
-    if interactive_mode and reencode is None:
+    # Only prompt when in interactive mode, abort sentinel not already set,
+    # and the flag was not passed on CLI.
+    if interactive_mode and reencode is None and (parts is not None or segment_time is not None):
         method_label = questionary.select(
             "Split method:",
             choices=[_METHOD_STREAM_COPY_LABEL, _METHOD_REENCODE_LABEL],
